@@ -57,6 +57,12 @@ from gi.repository import GLib  # noqa: E402
 from dbusmonitor import DbusMonitor  # noqa: E402
 from vedbus import VeDbusService  # noqa: E402
 
+from gate import (
+    DC_SYSTEM_THRESHOLDS,
+    HEARTBEAT_INTERVAL_S,
+    _is_substantial,
+)
+
 VERSION = "1.0.0"
 SERVICE_NAME = "com.victronenergy.dcsystem.virtual"
 
@@ -191,6 +197,19 @@ class VirtualDcSystem:
         self._energy_in = 0.0   # cumulative kWh consumed by DC loads
         self._last_time = time.time()
         self._last_log_time = 0.0
+
+        # Emit-gating state (see gate.py).  ``_last_substantial`` caches
+        # the precise value of each gated path at the moment we last
+        # emitted; the next cycle's value is compared against it via
+        # the per-path threshold in DC_SYSTEM_THRESHOLDS.  When nothing
+        # crosses a threshold we skip the D-Bus write entirely — vedbus
+        # emits no ItemsChanged for that cycle.
+        # ``_last_emit_time`` (monotonic) drives the periodic heartbeat
+        # that forces an emit at least every HEARTBEAT_INTERVAL_S even
+        # during a long quiet period, so freshness watchers don't think
+        # the service has died.
+        self._last_substantial: dict = {}
+        self._last_emit_time: float = 0.0
 
         # Start periodic update
         GLib.timeout_add_seconds(UPDATE_INTERVAL, self._update)
@@ -372,13 +391,39 @@ class VirtualDcSystem:
             self._energy_in += dc_system_power * dt_hours / 1000.0  # W*h -> kWh
         self._last_time = now
 
-        # ---- PUBLISH TO D-BUS ----
-        with self._service as svc:
-            svc["/Dc/0/Power"] = round(dc_system_power, 1)
-            svc["/Dc/0/Current"] = round(dc_load_current, 1)
-            svc["/Dc/0/Voltage"] = round(voltage, 2)
-            svc["/History/EnergyIn"] = round(self._energy_in, 3)
-            svc["/History/EnergyOut"] = 0
+        # ---- PUBLISH TO D-BUS (gated) ----
+        #
+        # Compare the new aggregates against the precise values we last
+        # emitted.  If no path has moved by at least its threshold (see
+        # DC_SYSTEM_THRESHOLDS in gate.py), we skip the write block
+        # entirely and vedbus emits no signal for this cycle.  When we
+        # DO emit, we publish the precise (unrounded) values so
+        # downstream consumers keep full resolution.
+        new_values = {
+            "/Dc/0/Power":         dc_system_power,
+            "/Dc/0/Current":       dc_load_current,
+            "/Dc/0/Voltage":       voltage,
+            "/History/EnergyIn":   self._energy_in,
+        }
+        substantial = _is_substantial(
+            new_values, self._last_substantial, DC_SYSTEM_THRESHOLDS
+        )
+        heartbeat_due = (
+            now - self._last_emit_time >= HEARTBEAT_INTERVAL_S
+        )
+
+        if substantial or heartbeat_due:
+            with self._service as svc:
+                svc["/Dc/0/Power"] = dc_system_power
+                svc["/Dc/0/Current"] = dc_load_current
+                svc["/Dc/0/Voltage"] = voltage
+                svc["/History/EnergyIn"] = self._energy_in
+                svc["/History/EnergyOut"] = 0
+            # Snapshot what we just emitted so the next cycle compares
+            # against THIS, not against the previous emit.
+            for path, val in new_values.items():
+                self._last_substantial[path] = val
+            self._last_emit_time = now
 
         # ---- PERIODIC LOGGING ----
         if now - self._last_log_time >= LOG_INTERVAL:
