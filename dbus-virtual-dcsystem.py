@@ -328,8 +328,16 @@ class VirtualDcSystem:
             if self._is_aggregate(svc):
                 continue
             pn = self._get_value(svc, "/ProductName") or ""
-            v = self._get_value(svc, "/Dc/0/Voltage") or 0
-            i = self._get_value(svc, "/Dc/0/Current") or 0
+            v = self._get_value(svc, "/Dc/0/Voltage")
+            i = self._get_value(svc, "/Dc/0/Current")
+            # A battery service that doesn't publish a current measurement
+            # can't contribute to power math — its V*I term would be V*0
+            # and silently pull the battery_power total toward zero.
+            # Real example: a SeeLevel BTP3 channel configured as a
+            # battery voltage gauge publishes ``/Dc/0/Voltage`` but
+            # leaves ``/Dc/0/Current`` as None.  Skip these.
+            if v is None or i is None:
+                continue
             power = v * i
             if self._is_smartshunt(pn):
                 shunt_power += power
@@ -338,8 +346,21 @@ class VirtualDcSystem:
                 bms_power += power
                 bms_count += 1
 
-        # Decide which battery current to trust
-        if shunt_count > 0 and shunt_count == bms_count:
+        # Decide which battery current to trust.
+        # * shunt_count == bms_count (>0) — classic "shunt + BMS per
+        #   battery" setup; shunts have sub-amp precision so prefer
+        #   them.
+        # * bms_count == 0 and shunt_count > 0 — no real BMSes
+        #   present (or the only "battery" service was a voltage-only
+        #   gauge that we just filtered out above).  Trust the shunts;
+        #   the alternative is publishing 0 W of battery power, which
+        #   makes the system think nothing is happening and breaks
+        #   DC-Load math everywhere downstream.
+        # * Otherwise — fall back to BMS power.  Mixed setups where
+        #   the BMS count exceeds the shunt count are deliberately
+        #   served by BMS data because the shunts wouldn't represent
+        #   the whole bank.
+        if shunt_count > 0 and (shunt_count == bms_count or bms_count == 0):
             battery_power = shunt_power
             battery_source = "shunt"
         else:
