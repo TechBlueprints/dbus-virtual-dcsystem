@@ -61,13 +61,33 @@ dc_load = sum(all DC sources) − sum(battery power)
 | `com.victronenergy.dcsource` | SmartShunts configured as DC source meters |
 | `com.victronenergy.inverter` | VE.Direct inverters |
 
-### Battery Power (auto-detected)
+### Battery Power
 
-The service prefers **SmartShunt** readings for battery current because they
-provide sub-amp precision (e.g. 0.3 A), whereas many BMS units round to whole
-amps. SmartShunts are used when the number of SmartShunt-type battery services
-equals the number of BMS battery services (i.e. one shunt per physical
-battery). Otherwise BMS V\*I is used as a fallback.
+The service sums **V × I** across every `com.victronenergy.battery.*`
+service that publishes both `/Dc/0/Voltage` and `/Dc/0/Current`.  This
+catches the common monitor types — SmartShunts, BMV-712/700,
+Pylontech/BYD/Discover/etc. BMSes, and community drivers like
+`dbus-serialbattery` — without trying to guess the device type from
+its `ProductName` string.
+
+A battery service that publishes voltage but no current (e.g. a
+SeeLevel BTP3 channel configured as a battery voltage gauge) is
+excluded from the sum.  Such a service can't contribute a meaningful
+V × I term, and silently treating its current as zero would pull the
+battery_power total toward zero and break DC-Load math everywhere
+downstream.
+
+Aggregator services (name contains "aggregate") are also excluded so
+that `dbus-aggregate-batteries` and its constituent shunts don't
+get counted twice.
+
+**Overlap caveat**: if you have a SmartShunt AND a separate BMS both
+reporting the SAME battery bank as distinct services, both will be
+counted and you'll see roughly double the real battery power.  In
+that topology the right solution is to put `dbus-aggregate-batteries`
+in front of them so the overlap is resolved upstream, or use
+`/Settings/SystemSetup/BatteryService` to mark one as the primary
+battery service.
 
 Battery services whose D-Bus name contains `aggregate` are automatically
 excluded to prevent double-counting from services like
@@ -75,9 +95,14 @@ excluded to prevent double-counting from services like
 
 ### DC Bus Voltage
 
-The published voltage is the **maximum** reading across all SmartShunts and
-VE.Bus devices. This best represents the actual DC bus voltage, especially
-when chargers are actively pushing voltage above battery resting levels.
+The published voltage is the **maximum** reading across all battery
+monitors that publish current (see above) plus all VE.Bus devices.
+The highest reading best represents the actual DC bus voltage,
+especially when chargers are actively pushing voltage above battery
+resting levels.  Voltage-only services (like a SeeLevel battery
+channel) are excluded from this reference selection too, since they
+sometimes report a slightly different rail voltage that's less
+authoritative than the main-bus reading.
 
 ## Use Cases
 
@@ -167,10 +192,12 @@ UPDATE_INTERVAL = 1
 
 ; How often to emit a summary log line (seconds)
 LOG_INTERVAL = 300
-
-; Keyword to identify SmartShunt devices by ProductName
-SMARTSHUNT_KEYWORD = SmartShunt
 ```
+
+> The previous `SMARTSHUNT_KEYWORD` setting was removed.  Battery
+> services are now categorised by whether they publish
+> `/Dc/0/Current`, not by their `ProductName` string — see the
+> "Battery Power" section above.
 
 ## Service Management
 

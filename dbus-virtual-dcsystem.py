@@ -85,7 +85,12 @@ cfg = load_config()
 LOG_LEVEL = getattr(logging, cfg.get("LOGGING", "INFO").upper(), logging.INFO)
 UPDATE_INTERVAL = int(cfg.get("UPDATE_INTERVAL", "1"))
 LOG_INTERVAL = int(cfg.get("LOG_INTERVAL", "300"))
-SMARTSHUNT_KEYWORD = cfg.get("SMARTSHUNT_KEYWORD", "SmartShunt")
+# Note: ``SMARTSHUNT_KEYWORD`` was previously read here to identify
+# SmartShunts by ProductName for a shunt-vs-BMS classification step.
+# That heuristic was removed — the discriminator is now whether the
+# battery service publishes ``/Dc/0/Current``, not what its name says.
+# See ``_battery_publishes_current`` for the rationale.  The
+# ``config.default.ini`` line is now ignored if present.
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -247,9 +252,33 @@ class VirtualDcSystem:
         """Check if a battery service is an aggregate (should be excluded)."""
         return "aggregate" in service_name.lower()
 
-    def _is_smartshunt(self, product_name):
-        """Check if a battery is a SmartShunt by ProductName."""
-        return product_name is not None and SMARTSHUNT_KEYWORD in product_name
+    def _battery_publishes_current(self, svc) -> bool:
+        """Return True iff *svc* is a ``com.victronenergy.battery.*``
+        service that publishes both ``/Dc/0/Voltage`` and
+        ``/Dc/0/Current`` — i.e. it has a real shunt or some equivalent
+        current sensor.
+
+        This is the **only** signal we use to decide whether a battery
+        service contributes to power math.  We deliberately avoid
+        guessing based on ``ProductName`` strings:
+
+          * Anything publishing V+I has a meaningful V*I term to
+            contribute.  Doesn't matter whether it's a SmartShunt,
+            BMV-712, Pylontech BMS, custom Modbus monitor, or a
+            community ``dbus-serialbattery`` instance — they all
+            speak the same V+I contract.
+          * Anything without ``/Dc/0/Current`` (e.g. a SeeLevel BTP3
+            channel configured as a battery voltage gauge) can't
+            contribute to a power sum.  Its V*0 = 0 W term would
+            silently pull the total toward zero and break DC-Load
+            math everywhere downstream.
+
+        Returns False for both genuinely-missing keys and explicit
+        Nones.
+        """
+        v = self._get_value(svc, "/Dc/0/Voltage")
+        i = self._get_value(svc, "/Dc/0/Current")
+        return v is not None and i is not None
 
     # -------------------------------------------------------------------
     # Main calculation
@@ -315,57 +344,39 @@ class VirtualDcSystem:
                 inverter_power -= ac_v * ac_i
 
         # ---- BATTERY POWER ----
-        # Auto-detect SmartShunts vs BMS.  Prefer SmartShunts for sub-amp
-        # precision when shunt_count == bms_count (one shunt per battery).
-        # Exclude any service name containing "aggregate" to prevent
-        # double-counting from dbus-aggregate-batteries.
-        shunt_power = 0.0
-        shunt_count = 0
-        bms_power = 0.0
-        bms_count = 0
-
+        # Sum V*I over every battery service that publishes BOTH
+        # voltage and current.  See ``_battery_publishes_current`` for
+        # the rationale on why current-publishing is the right
+        # discriminator (and why guessing by ProductName isn't).
+        #
+        # Exclude aggregator services (name contains "aggregate") to
+        # avoid double-counting — ``dbus-aggregate-batteries`` and
+        # similar roll up multiple underlying services and re-publish
+        # the totals; if we included both the aggregate AND its
+        # constituent shunts we'd count the same current twice.
+        #
+        # Caveat on overlapping monitors: if you have a SmartShunt AND
+        # a separate BMS reporting the SAME battery bank as distinct
+        # ``com.victronenergy.battery.*`` services, both will be
+        # counted — currents add, you'll see roughly double the real
+        # battery power.  In that topology the right thing is to put
+        # an aggregate service in front of them so the overlap is
+        # resolved upstream (rename the underlying services with
+        # "aggregate" if you want them auto-excluded here, or use
+        # ``/Settings/SystemSetup/BatteryService`` to mark one as
+        # primary).  In practice the common topologies — N shunts on
+        # N independent banks, or 1 BMS on 1 bank — don't overlap.
+        battery_power = 0.0
+        battery_count = 0
         for svc in self._get_service_list("com.victronenergy.battery"):
             if self._is_aggregate(svc):
                 continue
-            pn = self._get_value(svc, "/ProductName") or ""
-            v = self._get_value(svc, "/Dc/0/Voltage")
-            i = self._get_value(svc, "/Dc/0/Current")
-            # A battery service that doesn't publish a current measurement
-            # can't contribute to power math — its V*I term would be V*0
-            # and silently pull the battery_power total toward zero.
-            # Real example: a SeeLevel BTP3 channel configured as a
-            # battery voltage gauge publishes ``/Dc/0/Voltage`` but
-            # leaves ``/Dc/0/Current`` as None.  Skip these.
-            if v is None or i is None:
+            if not self._battery_publishes_current(svc):
                 continue
-            power = v * i
-            if self._is_smartshunt(pn):
-                shunt_power += power
-                shunt_count += 1
-            else:
-                bms_power += power
-                bms_count += 1
-
-        # Decide which battery current to trust.
-        # * shunt_count == bms_count (>0) — classic "shunt + BMS per
-        #   battery" setup; shunts have sub-amp precision so prefer
-        #   them.
-        # * bms_count == 0 and shunt_count > 0 — no real BMSes
-        #   present (or the only "battery" service was a voltage-only
-        #   gauge that we just filtered out above).  Trust the shunts;
-        #   the alternative is publishing 0 W of battery power, which
-        #   makes the system think nothing is happening and breaks
-        #   DC-Load math everywhere downstream.
-        # * Otherwise — fall back to BMS power.  Mixed setups where
-        #   the BMS count exceeds the shunt count are deliberately
-        #   served by BMS data because the shunts wouldn't represent
-        #   the whole bank.
-        if shunt_count > 0 and (shunt_count == bms_count or bms_count == 0):
-            battery_power = shunt_power
-            battery_source = "shunt"
-        else:
-            battery_power = bms_power
-            battery_source = "bms"
+            v = self._get_value(svc, "/Dc/0/Voltage") or 0
+            i = self._get_value(svc, "/Dc/0/Current") or 0
+            battery_power += v * i
+            battery_count += 1
 
         # ---- FINAL CALCULATION ----
         total_sources = (
@@ -385,19 +396,26 @@ class VirtualDcSystem:
         if dc_system_power < 0:
             dc_system_power = 0.0
 
-        # Use the highest voltage across SmartShunts and VE.Bus (MultiPlus)
-        # as the DC bus reference.  The highest reading best represents the
-        # actual bus voltage -- chargers push voltage slightly above battery
-        # resting voltage, and SmartShunts measure at the battery terminals.
+        # Use the highest voltage across battery monitors (anything with
+        # V+I) and VE.Bus (MultiPlus) as the DC bus reference.  The
+        # highest reading best represents the actual bus voltage —
+        # chargers push voltage slightly above battery resting voltage,
+        # and shunt-based monitors measure at the battery terminals.
+        # We restrict to current-publishing services for two reasons:
+        # (1) voltage-only services (e.g. SeeLevel battery channel)
+        # sometimes report a slightly different rail voltage that's
+        # less authoritative than the main bus reading; (2) using the
+        # same filter as the power loop keeps the V reference and
+        # power source consistent.
         voltage = 0.0
         for svc in self._get_service_list("com.victronenergy.battery"):
             if self._is_aggregate(svc):
                 continue
-            pn = self._get_value(svc, "/ProductName") or ""
-            if self._is_smartshunt(pn):
-                v = self._get_value(svc, "/Dc/0/Voltage")
-                if v and v > voltage:
-                    voltage = v
+            if not self._battery_publishes_current(svc):
+                continue
+            v = self._get_value(svc, "/Dc/0/Voltage")
+            if v and v > voltage:
+                voltage = v
         for svc in self._get_service_list("com.victronenergy.vebus"):
             v = self._get_value(svc, "/Dc/0/Voltage")
             if v and v > voltage:
@@ -467,9 +485,7 @@ class VirtualDcSystem:
             if inverter_power:
                 parts.append("inv=%.0fW" % inverter_power)
             parts.append(
-                "batt=%.0fW[%s:%d+%d]" % (
-                    battery_power, battery_source, shunt_count, bms_count,
-                )
+                "batt=%.0fW[%d svc]" % (battery_power, battery_count)
             )
             parts.append("dc_load=%.0fW" % dc_system_power)
             parts.append("%.1fA" % dc_load_current)
