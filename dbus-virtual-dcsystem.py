@@ -132,6 +132,10 @@ def _build_monitor_list():
             "/Ac/Out/L1/V": _DUMMY,  # fallback for DC-less inverters
             "/Ac/Out/L1/I": _DUMMY,
         },
+        # --- systemcalc: the user-designated primary battery service ---
+        "com.victronenergy.system": {
+            "/ActiveBatteryService": _DUMMY,
+        },
         # --- Batteries (for battery current measurement) ---
         "com.victronenergy.battery": {
             "/Dc/0/Voltage": _DUMMY,
@@ -246,6 +250,30 @@ class VirtualDcSystem:
             i = self._get_value(svc, "/Dc/0/Current") or 0
             total += v * i
         return total
+
+    def _active_battery_service(self):
+        """Resolve systemcalc's /ActiveBatteryService ("com.victronenergy.battery/99")
+        to the concrete D-Bus service name, or None.
+
+        When the user designated a battery service (typically an
+        aggregator that already resolves overlapping monitors), that
+        single service is the authoritative battery term — summing the
+        underlying services would double-count banks that are reported
+        by both a BMS and a SmartShunt.
+        """
+        active = self._get_value("com.victronenergy.system", "/ActiveBatteryService")
+        if not active or "/" not in str(active):
+            return None
+        svc_class, _, instance = str(active).partition("/")
+        try:
+            instance = int(instance)
+        except ValueError:
+            return None
+        for svc in self._get_service_list("com.victronenergy.battery"):
+            if self._get_value(svc, "/DeviceInstance") == instance:
+                if self._get_value(svc, "/Dc/0/Voltage") is not None and self._get_value(svc, "/Dc/0/Current") is not None:
+                    return svc
+        return None
 
     @staticmethod
     def _is_aggregate(service_name):
@@ -368,15 +396,27 @@ class VirtualDcSystem:
         # N independent banks, or 1 BMS on 1 bank — don't overlap.
         battery_power = 0.0
         battery_count = 0
-        for svc in self._get_service_list("com.victronenergy.battery"):
-            if self._is_aggregate(svc):
-                continue
-            if not self._battery_publishes_current(svc):
-                continue
-            v = self._get_value(svc, "/Dc/0/Voltage") or 0
-            i = self._get_value(svc, "/Dc/0/Current") or 0
-            battery_power += v * i
-            battery_count += 1
+        # Prefer the user-designated primary battery service (usually an
+        # aggregator): it already resolves overlapping monitors, whereas
+        # summing constituents double-counts a bank reported by both a
+        # BMS and a SmartShunt (observed live: DVCC compensation halved
+        # while charging, causing grid under-draw and battery seesaw).
+        active_svc = self._active_battery_service()
+        if active_svc is not None:
+            v = self._get_value(active_svc, "/Dc/0/Voltage") or 0
+            i = self._get_value(active_svc, "/Dc/0/Current") or 0
+            battery_power = v * i
+            battery_count = 1
+        else:
+            for svc in self._get_service_list("com.victronenergy.battery"):
+                if self._is_aggregate(svc):
+                    continue
+                if not self._battery_publishes_current(svc):
+                    continue
+                v = self._get_value(svc, "/Dc/0/Voltage") or 0
+                i = self._get_value(svc, "/Dc/0/Current") or 0
+                battery_power += v * i
+                battery_count += 1
 
         # ---- FINAL CALCULATION ----
         total_sources = (
