@@ -143,6 +143,10 @@ def _build_monitor_list():
             "/Dc/0/Power": _DUMMY,
             "/ProductName": _DUMMY,
             "/DeviceInstance": _DUMMY,
+            "/Measurement/Kind": _DUMMY,
+            "/Measurement/PhysicalDevice": _DUMMY,
+            "/Measurement/PeerServices": _DUMMY,
+            "/Measurement/LineAuthority": _DUMMY,
         },
     }
 
@@ -250,6 +254,66 @@ class VirtualDcSystem:
             i = self._get_value(svc, "/Dc/0/Current") or 0
             total += v * i
         return total
+
+    def _resolve_measurement_graph(self):
+        """Resolve the declared measurement graph to one representative
+        battery service per physical device.
+
+        Battery services may publish /Measurement/* declarations:
+          Kind            "direct" (own sensors) or "derived" (aggregator)
+          PhysicalDevice  ID of the physical pack the service observes
+          PeerServices    other direct observers of the same pack (e.g.
+                          a SmartShunt wired in series, which cannot
+                          declare itself)
+          LineAuthority   the peer best suited for line V/I sums
+
+        Returns (representatives, grouped_services) — the chosen services
+        to sum, and the set of ALL services claimed by any group (so the
+        caller can exclude them from legacy summation) — or (None, None)
+        if no declarations are present.
+        """
+        groups = {}
+        claimed = set()
+        for svc in self._get_service_list("com.victronenergy.battery"):
+            kind = self._get_value(svc, "/Measurement/Kind")
+            if kind == "derived":
+                claimed.add(svc)
+                continue
+            if kind != "direct":
+                continue
+            phys = self._get_value(svc, "/Measurement/PhysicalDevice")
+            if not phys:
+                continue
+            group = groups.setdefault(phys, {"declarer": svc, "authority": None, "members": set()})
+            group["members"].add(svc)
+            claimed.add(svc)
+            peers = self._get_value(svc, "/Measurement/PeerServices") or ""
+            for peer in str(peers).split(","):
+                peer = peer.strip()
+                if peer:
+                    group["members"].add(peer)
+                    claimed.add(peer)
+            authority = self._get_value(svc, "/Measurement/LineAuthority")
+            if authority:
+                group["authority"] = str(authority).strip()
+        if not groups:
+            return None, None
+
+        reps = []
+        for phys, group in groups.items():
+            candidates = []
+            if group["authority"]:
+                candidates.append(group["authority"])
+            candidates.append(group["declarer"])
+            candidates.extend(sorted(group["members"]))
+            rep = None
+            for cand in candidates:
+                if self._get_value(cand, "/Dc/0/Voltage") is not None and self._get_value(cand, "/Dc/0/Current") is not None:
+                    rep = cand
+                    break
+            if rep is not None:
+                reps.append(rep)
+        return reps, claimed
 
     def _active_battery_service(self):
         """Resolve systemcalc's /ActiveBatteryService ("com.victronenergy.battery/99")
@@ -401,8 +465,23 @@ class VirtualDcSystem:
         # summing constituents double-counts a bank reported by both a
         # BMS and a SmartShunt (observed live: DVCC compensation halved
         # while charging, causing grid under-draw and battery seesaw).
-        active_svc = self._active_battery_service()
-        if active_svc is not None:
+        graph_reps, graph_claimed = self._resolve_measurement_graph()
+        active_svc = None if graph_reps is not None else self._active_battery_service()
+        if graph_reps is not None:
+            for svc in graph_reps:
+                v = self._get_value(svc, "/Dc/0/Voltage") or 0
+                i = self._get_value(svc, "/Dc/0/Current") or 0
+                battery_power += v * i
+                battery_count += 1
+            # legacy handling for any battery service outside the graph
+            for svc in self._get_service_list("com.victronenergy.battery"):
+                if svc in graph_claimed or self._is_aggregate(svc):
+                    continue
+                if not self._battery_publishes_current(svc):
+                    continue
+                battery_power += (self._get_value(svc, "/Dc/0/Voltage") or 0) * (self._get_value(svc, "/Dc/0/Current") or 0)
+                battery_count += 1
+        elif active_svc is not None:
             v = self._get_value(active_svc, "/Dc/0/Voltage") or 0
             i = self._get_value(active_svc, "/Dc/0/Current") or 0
             battery_power = v * i
