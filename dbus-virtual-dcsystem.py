@@ -28,17 +28,20 @@ on D-Bus with zero configuration:
 
   DC sources: solarcharger, vebus, multi, alternator, charger,
               fuelcell, dcsource, inverter
-  Battery:    SmartShunts (preferred for sub-amp precision) or BMS
+  Battery:    declared measurement graph (/Measurement/* paths),
+              systemcalc's ActiveBatteryService, or V*I over every
+              current-publishing battery service — in that order
 
-  dc_load = sum(sources) - sum(battery)
+  dc_load = sum(sources) - battery
 
-SmartShunts are preferred for battery current when the number of
-SmartShunt-type battery services equals the number of BMS battery
-services (i.e. one shunt per physical battery).  Otherwise BMS V*I
-is used as a fallback.
+The measurement graph (see topology.py) is cached and sticky: it
+resolves overlapping monitors (a BMS and its paired SmartShunt on the
+same pack) to one representative each, and a transient None from the
+dbus cache never collapses it back to a double-counting fallback.
 
-Battery services whose name contains "aggregate" are excluded to
-prevent double-counting from dbus-aggregate-batteries.
+Battery services whose name contains "aggregate" are excluded from
+legacy summation to prevent double-counting from
+dbus-aggregate-batteries.
 """
 
 import configparser
@@ -61,6 +64,11 @@ from gate import (
     DC_SYSTEM_THRESHOLDS,
     HEARTBEAT_INTERVAL_S,
     _is_substantial,
+)
+from topology import (
+    derive_groups,
+    merge_topology,
+    select_representative,
 )
 
 VERSION = "1.0.0"
@@ -224,6 +232,23 @@ class VirtualDcSystem:
         self._last_substantial: dict = {}
         self._last_emit_time: float = 0.0
 
+        # Cached measurement-graph topology (see topology.py).
+        # ``_topology`` is None until the first successful derivation,
+        # then a dict of groups FOREVER — once any topology has
+        # resolved, the active-battery-service and sum-everything
+        # fallbacks are permanently off the table, because a transient
+        # failure to re-derive the graph must never downgrade the
+        # battery term to a source known to double-count.
+        # ``_claimed`` is the sticky set of services owned by the
+        # graph (excluded from legacy summation).
+        # ``_batt_term_key`` tracks the battery-term composition so we
+        # log one line whenever the set of services forming the term
+        # changes — this failure mode was invisible until arithmetic
+        # forensics; composition changes must be visible in the log.
+        self._topology: dict | None = None
+        self._claimed: set = set()
+        self._batt_term_key: tuple | None = None
+
         # Start periodic update
         GLib.timeout_add_seconds(UPDATE_INTERVAL, self._update)
         logger.info(
@@ -255,65 +280,44 @@ class VirtualDcSystem:
             total += v * i
         return total
 
-    def _resolve_measurement_graph(self):
-        """Resolve the declared measurement graph to one representative
-        battery service per physical device.
+    def _refresh_topology(self):
+        """Derive the measurement graph and merge it into the cached
+        topology (see topology.py for the full model).
 
-        Battery services may publish /Measurement/* declarations:
-          Kind            "direct" (own sensors) or "derived" (aggregator)
-          PhysicalDevice  ID of the physical pack the service observes
-          PeerServices    other direct observers of the same pack (e.g.
-                          a SmartShunt wired in series, which cannot
-                          declare itself)
-          LineAuthority   the peer best suited for line V/I sums
-
-        Returns (representatives, grouped_services) — the chosen services
-        to sum, and the set of ALL services claimed by any group (so the
-        caller can exclude them from legacy summation) — or (None, None)
-        if no declarations are present.
+        The derivation runs every cycle — the reads come from
+        DbusMonitor's in-memory cache, so it's cheap, and re-deriving
+        catches services whose /Measurement declarations appear a few
+        cycles after the service itself does.  What makes the topology
+        stable is the merge: a cached group survives a cycle where its
+        declarations read as None (flaky cache) and is dropped only
+        when its declarer actually leaves the bus.
         """
-        groups = {}
-        claimed = set()
-        for svc in self._get_service_list("com.victronenergy.battery"):
-            kind = self._get_value(svc, "/Measurement/Kind")
-            if kind == "derived":
-                claimed.add(svc)
-                continue
-            if kind != "direct":
-                continue
-            phys = self._get_value(svc, "/Measurement/PhysicalDevice")
-            if not phys:
-                continue
-            group = groups.setdefault(phys, {"declarer": svc, "authority": None, "members": set()})
-            group["members"].add(svc)
-            claimed.add(svc)
-            peers = self._get_value(svc, "/Measurement/PeerServices") or ""
-            for peer in str(peers).split(","):
-                peer = peer.strip()
-                if peer:
-                    group["members"].add(peer)
-                    claimed.add(peer)
-            authority = self._get_value(svc, "/Measurement/LineAuthority")
-            if authority:
-                group["authority"] = str(authority).strip()
-        if not groups:
-            return None, None
+        services = self._get_service_list("com.victronenergy.battery")
+        fresh_groups, fresh_claimed = derive_groups(services, self._get_value)
 
-        reps = []
-        for phys, group in groups.items():
-            candidates = []
-            if group["authority"]:
-                candidates.append(group["authority"])
-            candidates.append(group["declarer"])
-            candidates.extend(sorted(group["members"]))
-            rep = None
-            for cand in candidates:
-                if self._get_value(cand, "/Dc/0/Voltage") is not None and self._get_value(cand, "/Dc/0/Current") is not None:
-                    rep = cand
-                    break
-            if rep is not None:
-                reps.append(rep)
-        return reps, claimed
+        if self._topology is None:
+            if fresh_groups:
+                self._topology = fresh_groups
+                self._claimed = fresh_claimed
+                logger.info(
+                    "Measurement topology resolved: %s",
+                    "; ".join(
+                        "%s -> %s" % (phys, ",".join(sorted(g["members"])))
+                        for phys, g in sorted(fresh_groups.items())
+                    ),
+                )
+            return
+
+        merged, claimed, changes, retained = merge_topology(
+            self._topology, self._claimed, fresh_groups, fresh_claimed,
+            set(services),
+        )
+        for msg in changes:
+            logger.info("Measurement topology: %s", msg)
+        for msg in retained:
+            logger.debug("Measurement topology: %s", msg)
+        self._topology = merged
+        self._claimed = claimed
 
     def _active_battery_service(self):
         """Resolve systemcalc's /ActiveBatteryService ("com.victronenergy.battery/99")
@@ -436,66 +440,93 @@ class VirtualDcSystem:
                 inverter_power -= ac_v * ac_i
 
         # ---- BATTERY POWER ----
-        # Sum V*I over every battery service that publishes BOTH
-        # voltage and current.  See ``_battery_publishes_current`` for
-        # the rationale on why current-publishing is the right
-        # discriminator (and why guessing by ProductName isn't).
+        # Branch priority, decided by the sticky topology cache:
         #
-        # Exclude aggregator services (name contains "aggregate") to
-        # avoid double-counting — ``dbus-aggregate-batteries`` and
-        # similar roll up multiple underlying services and re-publish
-        # the totals; if we included both the aggregate AND its
-        # constituent shunts we'd count the same current twice.
-        #
-        # Caveat on overlapping monitors: if you have a SmartShunt AND
-        # a separate BMS reporting the SAME battery bank as distinct
-        # ``com.victronenergy.battery.*`` services, both will be
-        # counted — currents add, you'll see roughly double the real
-        # battery power.  In that topology the right thing is to put
-        # an aggregate service in front of them so the overlap is
-        # resolved upstream (rename the underlying services with
-        # "aggregate" if you want them auto-excluded here, or use
-        # ``/Settings/SystemSetup/BatteryService`` to mark one as
-        # primary).  In practice the common topologies — N shunts on
-        # N independent banks, or 1 BMS on 1 bank — don't overlap.
+        #   1. Measurement graph (topology.py): one representative per
+        #      declared physical pack, plus legacy V*I for unclaimed
+        #      services.  Once ANY graph has resolved this is the only
+        #      branch that ever runs again — a transient failure to
+        #      re-derive the graph must never downgrade the battery
+        #      term.  (Observed live: falling through on a flaky read
+        #      fed DVCC a battery term that flapped between −6 A
+        #      correct, ~−9 A half-resolved, +1.66 A aggregate bounce,
+        #      and −12.8 A double-counted, causing charge-compensation
+        #      hunting.)
+        #   2. systemcalc's ActiveBatteryService (usually an
+        #      aggregator that already resolves overlapping monitors).
+        #   3. Legacy: sum V*I over every battery service publishing
+        #      BOTH voltage and current (see
+        #      ``_battery_publishes_current`` for why that's the
+        #      discriminator, not ProductName), excluding
+        #      "aggregate"-named services to avoid counting an
+        #      aggregate AND its constituent shunts twice.  Caveat: a
+        #      SmartShunt and a BMS reporting the SAME bank as
+        #      distinct services both get counted here — resolve that
+        #      upstream with /Measurement declarations, an aggregate,
+        #      or ``/Settings/SystemSetup/BatteryService``.
+        self._refresh_topology()
         battery_power = 0.0
         battery_count = 0
-        # Prefer the user-designated primary battery service (usually an
-        # aggregator): it already resolves overlapping monitors, whereas
-        # summing constituents double-counts a bank reported by both a
-        # BMS and a SmartShunt (observed live: DVCC compensation halved
-        # while charging, causing grid under-draw and battery seesaw).
-        graph_reps, graph_claimed = self._resolve_measurement_graph()
-        active_svc = None if graph_reps is not None else self._active_battery_service()
-        if graph_reps is not None:
-            for svc in graph_reps:
-                v = self._get_value(svc, "/Dc/0/Voltage") or 0
-                i = self._get_value(svc, "/Dc/0/Current") or 0
+        batt_term_services = []
+        if self._topology is not None:
+            mode = "graph"
+            for phys in sorted(self._topology):
+                rep = select_representative(
+                    self._topology[phys], self._battery_publishes_current
+                )
+                if rep is None:
+                    continue
+                v = self._get_value(rep, "/Dc/0/Voltage") or 0
+                i = self._get_value(rep, "/Dc/0/Current") or 0
                 battery_power += v * i
                 battery_count += 1
+                batt_term_services.append(rep)
             # legacy handling for any battery service outside the graph
             for svc in self._get_service_list("com.victronenergy.battery"):
-                if svc in graph_claimed or self._is_aggregate(svc):
+                if svc in self._claimed or self._is_aggregate(svc):
                     continue
                 if not self._battery_publishes_current(svc):
                     continue
                 battery_power += (self._get_value(svc, "/Dc/0/Voltage") or 0) * (self._get_value(svc, "/Dc/0/Current") or 0)
                 battery_count += 1
-        elif active_svc is not None:
-            v = self._get_value(active_svc, "/Dc/0/Voltage") or 0
-            i = self._get_value(active_svc, "/Dc/0/Current") or 0
-            battery_power = v * i
-            battery_count = 1
+                batt_term_services.append(svc)
         else:
-            for svc in self._get_service_list("com.victronenergy.battery"):
-                if self._is_aggregate(svc):
-                    continue
-                if not self._battery_publishes_current(svc):
-                    continue
-                v = self._get_value(svc, "/Dc/0/Voltage") or 0
-                i = self._get_value(svc, "/Dc/0/Current") or 0
-                battery_power += v * i
-                battery_count += 1
+            # No graph has ever resolved on this system.  Prefer the
+            # user-designated primary battery service (usually an
+            # aggregator): it already resolves overlapping monitors,
+            # whereas summing constituents double-counts a bank
+            # reported by both a BMS and a SmartShunt.
+            active_svc = self._active_battery_service()
+            if active_svc is not None:
+                mode = "active"
+                v = self._get_value(active_svc, "/Dc/0/Voltage") or 0
+                i = self._get_value(active_svc, "/Dc/0/Current") or 0
+                battery_power = v * i
+                battery_count = 1
+                batt_term_services.append(active_svc)
+            else:
+                mode = "sum"
+                for svc in self._get_service_list("com.victronenergy.battery"):
+                    if self._is_aggregate(svc):
+                        continue
+                    if not self._battery_publishes_current(svc):
+                        continue
+                    v = self._get_value(svc, "/Dc/0/Voltage") or 0
+                    i = self._get_value(svc, "/Dc/0/Current") or 0
+                    battery_power += v * i
+                    battery_count += 1
+                    batt_term_services.append(svc)
+
+        # One line whenever the battery-term composition changes, so a
+        # wrong term is visible in the log instead of requiring
+        # arithmetic forensics on the emitted values.
+        batt_term_key = (mode, tuple(sorted(batt_term_services)))
+        if batt_term_key != self._batt_term_key:
+            logger.info(
+                "Battery term [%s]: %s", mode,
+                ", ".join(sorted(batt_term_services)) or "(none)",
+            )
+            self._batt_term_key = batt_term_key
 
         # ---- FINAL CALCULATION ----
         total_sources = (
